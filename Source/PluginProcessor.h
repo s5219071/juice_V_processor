@@ -1,44 +1,44 @@
-#pragma once
+﻿#pragma once
 
 #include <JuceHeader.h>
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <vector>
 
 //==============================================================================
-// JuiceReverbAudioProcessor
+// JuiceEQAudioProcessor
 //
-// 이 클래스는 플러그인의 "오디오 엔진"입니다.
-// DAW가 보내는 오디오 블록을 받아서 리버브를 만들고, 다시 DAW로 돌려보냅니다.
+// JuiceEQ는 실시간 스펙트럴 EQ/레조넌스 억제기입니다.
+// 일반 EQ처럼 고정 주파수를 수동으로 깎는 방식이 아니라, 2048pt FFT로 입력을
+// 계속 분석하면서 주변 대역보다 튀어나온 공진만 자동으로 눌러 줍니다.
 //
-// 설계 철학:
-// - Dry 경로는 최대한 보존해서 원음의 펀치가 무너지지 않게 합니다.
-// - Wet 경로에만 리버브, 로우컷, 새추레이션, 스테레오 확장을 적용합니다.
-// - 입력 신호가 강할 때 wet만 자동으로 내려주는 Internal Ducking을 넣습니다.
-// - 모든 노브 값은 AudioProcessorValueTreeState(APVTS)로 관리합니다.
+// 핵심 구조:
+// 1. 2048 샘플을 모아 FFT로 주파수 영역으로 변환합니다.
+// 2. 각 FFT bin의 에너지가 주변 평균보다 얼마나 돌출되었는지 계산합니다.
+// 3. depth / sharpness / selectivity / softHard 값으로 억제 곡선을 만듭니다.
+// 4. 주파수별 gain을 곱한 뒤 inverse FFT로 시간 영역에 되돌립니다.
+// 5. 512 샘플 hop의 4중 overlap-add로 프레임 경계가 들리지 않게 합칩니다.
+//
+// Delta 모드에서는 최종 처리음이 아니라 FFT에서 제거된 성분만 출력합니다.
+// Sidechain 모드에서는 외부 사이드체인 신호의 주파수 분포를 분석해서,
+// 그 대역을 메인 신호에서 동적으로 비워 줍니다.
 //==============================================================================
-class JuiceReverbAudioProcessor final : public juce::AudioProcessor
+class JuiceEQAudioProcessor final : public juce::AudioProcessor
 {
 public:
-    JuiceReverbAudioProcessor();
-    ~JuiceReverbAudioProcessor() override;
+    JuiceEQAudioProcessor();
+    ~JuiceEQAudioProcessor() override;
 
-    // DAW가 재생을 시작하거나 샘플레이트가 바뀔 때 호출됩니다.
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
-
-    // DAW가 플러그인 리소스를 정리할 때 호출됩니다.
     void releaseResources() override;
 
    #ifndef JucePlugin_PreferredChannelConfigurations
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
    #endif
 
-    // 실제 오디오 처리가 일어나는 가장 중요한 함수입니다.
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override;
 
-    // 플러그인 UI 생성 관련 함수입니다.
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override;
 
@@ -54,159 +54,169 @@ public:
     const juce::String getProgramName (int index) override;
     void changeProgramName (int index, const juce::String& newName) override;
 
-    // DAW 프로젝트 저장/불러오기 때 APVTS 상태를 저장하고 복원합니다.
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
-    // UI가 슬라이더와 파라미터를 연결할 수 있도록 public으로 둡니다.
+    // UI가 파라미터를 안전하게 연결할 수 있도록 APVTS를 public으로 둡니다.
     juce::AudioProcessorValueTreeState apvts;
 
-    // UI의 Juice Tank가 읽는 간단한 미터 값입니다.
-    // 오디오 스레드와 UI 스레드가 동시에 접근하므로 atomic을 사용합니다.
+    // Juice Spectrum Visualizer용 데이터입니다.
+    // 값의 의미: 0.0 = 억제 없음, 1.0 = 매우 강한 억제.
+    static constexpr int getVisualizerBinCount() noexcept { return visualizerBinCount; }
+    void copySpectrumReductionData (float* destination, int destinationSize) const noexcept;
+
+    // 이전 에디터/미터 코드와의 호환을 위한 간단한 미터 접근자입니다.
     float getVisualLevel() const noexcept;
     float getDuckingDepth() const noexcept;
+    float getAverageSuppression() const noexcept;
 
 private:
     //==============================================================================
-    // 파라미터 ID
+    // APVTS 파라미터 ID입니다.
     //
-    // 이 문자열은 DAW 자동화와 프리셋 저장에 쓰입니다.
-    // 한 번 배포한 뒤에는 바꾸지 않는 것이 좋습니다.
+    // 이 문자열은 DAW 자동화와 프리셋 저장에 들어가므로,
+    // 배포 후에는 함부로 바꾸지 않는 편이 안전합니다.
     struct ParameterIDs
     {
-        static constexpr const char* mix        = "mix";
-        static constexpr const char* decay      = "decay";
-        static constexpr const char* size       = "size";
-        static constexpr const char* preDelay   = "preDelay";
-        static constexpr const char* lowCut     = "lowCut";
-        static constexpr const char* ducking    = "ducking";
-        static constexpr const char* saturation = "saturation";
-        static constexpr const char* width      = "width";
-        static constexpr const char* damping    = "damping";
+        static constexpr const char* depth       = "depth";
+        static constexpr const char* sharpness   = "sharpness";
+        static constexpr const char* selectivity = "selectivity";
+        static constexpr const char* softHard    = "softHard";
+        static constexpr const char* delta       = "delta";
+        static constexpr const char* sidechain   = "sidechain";
+        static constexpr const char* mix         = "mix";
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
     //==============================================================================
-    // 작은 DSP 부품들
+    // FFT / STFT 고정값
     //
-    // CombFilter와 AllpassFilter는 고전적인 Schroeder/Freeverb 계열 리버브의
-    // 기본 재료입니다. 여러 지연선이 서로 다른 시간으로 울리며 풍성한 꼬리를 만듭니다.
-    class CombFilter
-    {
-    public:
-        void prepare (int delaySamples);
-        void clear() noexcept;
-        float process (float input, float feedback, float damping) noexcept;
+    // fftOrder 11 => 2^11 = 2048pt FFT.
+    // hopSize 512 => 2048 샘플 프레임이 75% 겹칩니다.
+    // sqrt-Hann 분석 윈도우와 sqrt-Hann 합성 윈도우를 같이 쓰면 실제로는
+    // Hann 윈도우가 4장 겹치는 형태가 되고, hop = N/4에서 합이 일정해집니다.
+    static constexpr int fftOrder = 11;
+    static constexpr int fftSize = 1 << fftOrder;
+    static constexpr int hopSize = fftSize / 4;
+    static constexpr int fftDataSize = fftSize * 2;
+    static constexpr int numFrequencyBins = fftSize / 2 + 1;
+    static constexpr int maximumAudioChannels = 2;
+    static constexpr int visualizerBinCount = 128;
 
-    private:
-        std::vector<float> delayBuffer;
-        int writeIndex = 0;
-        float dampingMemory = 0.0f;
+    // 분석 sqrt-Hann * 합성 sqrt-Hann = Hann이고, 4중 overlap에서 Hann 합이
+    // 2가 되므로 0.5를 곱해 원래 레벨로 맞춥니다.
+    static constexpr float overlapAddGain = 0.5f;
+
+    struct FrameParameters
+    {
+        float depth = 0.0f;
+        float sharpness = 0.0f;
+        float selectivity = 0.0f;
+        float softHard = 0.0f;
     };
 
-    class AllpassFilter
+    struct MainChannelState
     {
-    public:
-        void prepare (int delaySamples);
-        void clear() noexcept;
-        float process (float input, float feedback) noexcept;
+        std::array<float, fftSize> inputRing {};
+        std::vector<float> dryDelay;
+        std::vector<float> processedOverlap;
+        std::vector<float> deltaOverlap;
 
-    private:
-        std::vector<float> delayBuffer;
-        int writeIndex = 0;
+        int inputWriteIndex = 0;
+        int dryDelayIndex = 0;
+        int overlapReadIndex = 0;
+
+        void prepare (int overlapRingSize, int latencySamples);
+        void clear() noexcept;
     };
 
-    // 한 채널의 리버브 탱크입니다.
-    // Comb 여러 개를 합친 뒤 Allpass로 퍼뜨려 밀도 높은 공간감을 만듭니다.
-    class ChannelReverbTank
+    struct SidechainChannelState
     {
-    public:
-        void prepare (double sampleRate, int stereoSpreadSamples);
-        void clear() noexcept;
-        float process (float input, float feedback, float damping, float diffusion) noexcept;
-
-    private:
-        std::array<CombFilter, 8> combs;
-        std::array<AllpassFilter, 4> allpasses;
-    };
-
-    // 좌우 두 개의 탱크를 묶은 스테레오 리버브입니다.
-    class StereoReverbTank
-    {
-    public:
-        void prepare (double sampleRate);
-        void clear() noexcept;
-
-        void process (float inputLeft,
-                      float inputRight,
-                      float feedback,
-                      float damping,
-                      float size,
-                      float& outputLeft,
-                      float& outputRight) noexcept;
-
-    private:
-        ChannelReverbTank leftTank;
-        ChannelReverbTank rightTank;
-
-        double currentSampleRate = 44100.0;
-        float lfoPhase = 0.0f;
-    };
-
-    // 1-pole high-pass 필터 상태입니다.
-    // Wet 리버브의 저역 뭉침을 줄이기 위해 두 번 직렬로 사용합니다.
-    struct HighPassState
-    {
-        float previousInput = 0.0f;
-        float previousOutput = 0.0f;
+        std::array<float, fftSize> inputRing {};
+        int inputWriteIndex = 0;
 
         void clear() noexcept;
     };
 
     //==============================================================================
-    // 내부 처리 함수
     float getParameterValue (const char* parameterID) const noexcept;
     void resetSmoothers();
     void clearDspState();
+    void initialiseWindow() noexcept;
 
-    float processPreDelay (int channel, float input, int delaySamples) noexcept;
-    void advancePreDelay() noexcept;
+    void pushMainSample (int channel, float sample) noexcept;
+    void pushSidechainSample (int channel, float sample) noexcept;
+    float readDryDelayThenStoreInput (int channel, float input) noexcept;
+    float readAndClearProcessedSample (int channel) noexcept;
+    float readAndClearDeltaSample (int channel) noexcept;
+    void advanceChannelCursors (int channel) noexcept;
 
-    static float processHighPass (HighPassState& state, float input, float coefficient) noexcept;
-    static float calculateHighPassCoefficient (float cutoffHz, double sampleRate) noexcept;
-    static float saturateSample (float input, float amount) noexcept;
+    void processSpectralFrame (int numMainChannels,
+                               int numSidechainChannels,
+                               bool useSidechain,
+                               const FrameParameters& parameters) noexcept;
+
+    void buildMagnitudeAnalysis (int numMainChannels,
+                                 int numSidechainChannels,
+                                 bool analyseSidechain) noexcept;
+
+    void calculateReductionCurve (bool useSidechain,
+                                  const FrameParameters& parameters) noexcept;
+
+    void renderChannelFrame (int channel) noexcept;
+    void addFrameToOverlapBuffers (int channel) noexcept;
+    void updateVisualizerData() noexcept;
+
+    void fillFftDataFromRing (const std::array<float, fftSize>& ring,
+                              int writeIndex) noexcept;
+
+    void smoothAcrossFrequency (const std::array<float, numFrequencyBins>& source,
+                                std::array<float, numFrequencyBins>& destination,
+                                int radius) const noexcept;
+
     static float softLimitSample (float input) noexcept;
     static float smoothStep (float value) noexcept;
+    static float safeDecibels (float linearGain) noexcept;
+    static float normalisedParameter (float percentValue) noexcept;
+    static float binToFrequency (int bin, double sampleRate) noexcept;
+    static int frequencyToBin (float frequency, double sampleRate) noexcept;
     static bool isFiniteAndPositive (double value) noexcept;
 
     //==============================================================================
-    // DSP 상태
-    StereoReverbTank reverbTank;
+    juce::dsp::FFT fft { fftOrder };
 
-    juce::AudioBuffer<float> preDelayBuffer;
-    int preDelayWritePosition = 0;
-    int maxPreDelaySamples = 1;
+    std::array<MainChannelState, maximumAudioChannels> mainChannelState;
+    std::array<SidechainChannelState, maximumAudioChannels> sidechainChannelState;
 
-    std::array<HighPassState, 2> lowCutStageA;
-    std::array<HighPassState, 2> lowCutStageB;
+    std::array<float, fftSize> sqrtHannWindow {};
 
+    std::array<float, fftDataSize> fftData {};
+    std::array<float, fftDataSize> deltaFftData {};
+
+    std::array<float, numFrequencyBins> mainMagnitudeDb {};
+    std::array<float, numFrequencyBins> sidechainMagnitudeDb {};
+    std::array<float, numFrequencyBins> mainLocalAverageDb {};
+    std::array<float, numFrequencyBins> sidechainLocalAverageDb {};
+    std::array<float, numFrequencyBins> rawReduction {};
+    std::array<float, numFrequencyBins> spreadReduction {};
+    std::array<float, numFrequencyBins> smoothedReduction {};
+    std::array<float, numFrequencyBins> binGain {};
+
+    int overlapRingSize = fftSize * 4;
+    int latencySamples = fftSize;
+    int samplesSinceLastFrame = 0;
     double sampleRateHz = 44100.0;
-    float duckingEnvelope = 0.0f;
 
-    // 파라미터가 갑자기 튀면 클릭이 생길 수 있으므로 짧게 부드럽게 움직입니다.
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> depthSmoother;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> sharpnessSmoother;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> selectivitySmoother;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> softHardSmoother;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> mixSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> decaySmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> sizeSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> preDelaySmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> lowCutSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> duckingSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> saturationSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> widthSmoother;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> dampingSmoother;
 
     std::atomic<float> visualLevel { 0.0f };
-    std::atomic<float> visualDuckingDepth { 0.0f };
+    std::atomic<float> averageSuppression { 0.0f };
+    std::array<std::atomic<float>, visualizerBinCount> visualReduction {};
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JuiceReverbAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JuiceEQAudioProcessor)
 };

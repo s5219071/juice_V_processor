@@ -1,74 +1,59 @@
-#include "PluginProcessor.h"
+﻿#include "PluginProcessor.h"
 #include "PluginEditor.h"
+
+#include <algorithm>
+#include <limits>
 
 namespace
 {
-    // 44.1kHz 기준 Freeverb 계열 튜닝값입니다.
-    // 샘플레이트가 바뀌면 prepare()에서 비율에 맞게 늘리거나 줄입니다.
-    constexpr std::array<int, 8> combTunings    { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
-    constexpr std::array<int, 4> allpassTunings { 556, 441, 341, 225 };
+    constexpr float minimumDecibels = -140.0f;
+    constexpr float minimumUsefulFrequency = 20.0f;
 
-    constexpr double referenceSampleRate = 44100.0;
-    constexpr int stereoSpreadSamples = 23;
-    constexpr double maxPreDelaySeconds = 0.25;
-
-    constexpr float minimumDuckingGain = 0.18f;
+    // 시각화용 로그 주파수 범위입니다. 20 Hz부터 거의 Nyquist까지를
+    // 128칸으로 나누어 저역은 촘촘하게, 고역은 넓게 보여 줍니다.
+    constexpr float visualMinimumFrequency = 20.0f;
 }
 
 //==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout
-JuiceReverbAudioProcessor::createParameterLayout()
+JuiceEQAudioProcessor::createParameterLayout()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
     auto percentRange = juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f);
 
-    auto decayRange = juce::NormalisableRange<float> (0.5f, 12.0f, 0.01f);
-    decayRange.setSkewForCentre (3.5f);
-
-    auto preDelayRange = juce::NormalisableRange<float> (0.0f, 180.0f, 0.1f);
-    preDelayRange.setSkewForCentre (35.0f);
-
-    auto lowCutRange = juce::NormalisableRange<float> (20.0f, 600.0f, 0.1f);
-    lowCutRange.setSkewForCentre (150.0f);
-
-    auto widthRange = juce::NormalisableRange<float> (50.0f, 200.0f, 0.1f);
-
-    // Mix: 최종 dry/wet 비율입니다. 0%는 원음만, 100%는 리버브만 들립니다.
+    // Depth: 최대로 얼마나 깊게 깎을지입니다.
+    // 0%는 완전 무처리, 100%는 매우 강한 레조넌스 제거입니다.
     params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::mix, 1 }, "Mix", percentRange, 35.0f));
+        juce::ParameterID { ParameterIDs::depth, 1 }, "Depth", percentRange, 45.0f));
 
-    // Decay: 리버브 꼬리가 얼마나 오래 남는지 정합니다.
+    // Sharpness: 억제 곡선의 폭입니다.
+    // 낮으면 넓은 붓으로 부드럽게 누르고, 높으면 좁은 칼날처럼 특정 bin 주변만 누릅니다.
     params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::decay, 1 }, "Decay", decayRange, 4.5f));
+        juce::ParameterID { ParameterIDs::sharpness, 1 }, "Sharpness", percentRange, 62.0f));
 
-    // Size: 공간의 체감 크기입니다. feedback과 확산감에 함께 영향을 줍니다.
+    // Selectivity: "튀어나왔다"고 판단하는 기준입니다.
+    // 높을수록 정말 두드러지는 공진만 잡고, 낮을수록 더 많은 대역을 적극적으로 잡습니다.
     params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::size, 1 }, "Size", percentRange, 78.0f));
+        juce::ParameterID { ParameterIDs::selectivity, 1 }, "Selectivity", percentRange, 58.0f));
 
-    // Pre Delay: 원음 뒤에 리버브가 살짝 늦게 붙게 해서 트랜스 킥/리드의 앞부분을 살립니다.
+    // Soft/Hard: 억제 반응의 무릎(knee)입니다.
+    // Soft는 마스터링용으로 자연스럽게, Hard는 문제 대역을 더 단호하게 처리합니다.
     params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::preDelay, 1 }, "Pre Delay", preDelayRange, 32.0f));
+        juce::ParameterID { ParameterIDs::softHard, 1 }, "Soft / Hard", percentRange, 35.0f));
 
-    // Low Cut: 리버브 wet에만 걸리는 저역 정리 필터입니다.
-    params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::lowCut, 1 }, "Low Cut", lowCutRange, 150.0f));
+    // Delta: 켜면 최종 처리음이 아니라 "사라지는 소리"만 출력합니다.
+    params.push_back (std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { ParameterIDs::delta, 1 }, "Delta", false));
 
-    // Ducking: 입력이 강할 때 wet만 자동으로 줄이는 내부 사이드체인 양입니다.
-    params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::ducking, 1 }, "Ducking", percentRange, 45.0f));
+    // Sidechain: 켜면 외부 사이드체인 입력을 분석하여 같은 주파수 대역을 메인에서 비웁니다.
+    params.push_back (std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { ParameterIDs::sidechain, 1 }, "Sidechain", false));
 
-    // Saturation: 리버브 꼬리에 따뜻한 배음을 더하는 Juice 노브입니다.
+    // Mix: latency가 맞춰진 dry와 spectral processed 신호의 블렌드입니다.
+    // Delta 모드에서는 요구사항에 맞게 mix를 무시하고 억제 성분만 출력합니다.
     params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::saturation, 1 }, "Juice", percentRange, 24.0f));
-
-    // Width: wet 리버브의 Mid-Side 스테레오 폭입니다.
-    params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::width, 1 }, "Width", widthRange, 132.0f));
-
-    // Damping: 리버브 꼬리의 고역이 얼마나 부드럽게 줄어드는지 정합니다.
-    params.push_back (std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID { ParameterIDs::damping, 1 }, "Damping", percentRange, 42.0f));
+        juce::ParameterID { ParameterIDs::mix, 1 }, "Mix", percentRange, 100.0f));
 
     return { params.begin(), params.end() };
 }
@@ -76,37 +61,40 @@ JuiceReverbAudioProcessor::createParameterLayout()
 //==============================================================================
 #ifndef JucePlugin_PreferredChannelConfigurations
 
-JuiceReverbAudioProcessor::JuiceReverbAudioProcessor()
+JuiceEQAudioProcessor::JuiceEQAudioProcessor()
     : AudioProcessor (BusesProperties()
         #if ! JucePlugin_IsMidiEffect
          #if ! JucePlugin_IsSynth
-          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+          .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
+          .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false)
          #endif
-          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+          .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
         #endif
       ),
       apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    initialiseWindow();
 }
 
 #else
 
-JuiceReverbAudioProcessor::JuiceReverbAudioProcessor()
+JuiceEQAudioProcessor::JuiceEQAudioProcessor()
     : apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    initialiseWindow();
 }
 
 #endif
 
-JuiceReverbAudioProcessor::~JuiceReverbAudioProcessor() = default;
+JuiceEQAudioProcessor::~JuiceEQAudioProcessor() = default;
 
 //==============================================================================
-const juce::String JuiceReverbAudioProcessor::getName() const
+const juce::String JuiceEQAudioProcessor::getName() const
 {
-    return JucePlugin_Name;
+    return "JuiceEQ";
 }
 
-bool JuiceReverbAudioProcessor::acceptsMidi() const
+bool JuiceEQAudioProcessor::acceptsMidi() const
 {
    #if JucePlugin_WantsMidiInput
     return true;
@@ -115,7 +103,7 @@ bool JuiceReverbAudioProcessor::acceptsMidi() const
    #endif
 }
 
-bool JuiceReverbAudioProcessor::producesMidi() const
+bool JuiceEQAudioProcessor::producesMidi() const
 {
    #if JucePlugin_ProducesMidiOutput
     return true;
@@ -124,7 +112,7 @@ bool JuiceReverbAudioProcessor::producesMidi() const
    #endif
 }
 
-bool JuiceReverbAudioProcessor::isMidiEffect() const
+bool JuiceEQAudioProcessor::isMidiEffect() const
 {
    #if JucePlugin_IsMidiEffect
     return true;
@@ -133,64 +121,72 @@ bool JuiceReverbAudioProcessor::isMidiEffect() const
    #endif
 }
 
-double JuiceReverbAudioProcessor::getTailLengthSeconds() const
+double JuiceEQAudioProcessor::getTailLengthSeconds() const
 {
-    // 리버브 플러그인은 입력이 멈춘 뒤에도 꼬리가 남습니다.
-    return 14.0;
+    // JuiceEQ는 리버브처럼 입력이 멈춘 뒤 꼬리가 남는 플러그인이 아닙니다.
+    // 다만 FFT 처리를 위해 latencySamples만큼의 지연은 DAW에 따로 보고합니다.
+    return 0.0;
 }
 
-int JuiceReverbAudioProcessor::getNumPrograms()
+int JuiceEQAudioProcessor::getNumPrograms()
 {
     return 1;
 }
 
-int JuiceReverbAudioProcessor::getCurrentProgram()
+int JuiceEQAudioProcessor::getCurrentProgram()
 {
     return 0;
 }
 
-void JuiceReverbAudioProcessor::setCurrentProgram (int index)
+void JuiceEQAudioProcessor::setCurrentProgram (int index)
 {
     juce::ignoreUnused (index);
 }
 
-const juce::String JuiceReverbAudioProcessor::getProgramName (int index)
+const juce::String JuiceEQAudioProcessor::getProgramName (int index)
 {
     juce::ignoreUnused (index);
     return {};
 }
 
-void JuiceReverbAudioProcessor::changeProgramName (int index, const juce::String& newName)
+void JuiceEQAudioProcessor::changeProgramName (int index, const juce::String& newName)
 {
     juce::ignoreUnused (index, newName);
 }
 
 //==============================================================================
-void JuiceReverbAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+void JuiceEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     juce::ignoreUnused (samplesPerBlock);
 
     sampleRateHz = isFiniteAndPositive (sampleRate) ? sampleRate : 44100.0;
 
-    // 프리딜레이는 최대 250ms까지만 내부 버퍼를 잡습니다.
-    // 실제 노브 범위는 180ms라서 여유분이 있습니다.
-    maxPreDelaySamples = juce::jmax (1, static_cast<int> (sampleRateHz * maxPreDelaySeconds));
-    preDelayBuffer.setSize (2, maxPreDelaySamples + 1);
+    // 이 구현은 입력 샘플이 2048 샘플 뒤에 정확히 재생되도록 overlap-add를
+    // 스케줄합니다. DAW가 트랙 보정(PDC)을 할 수 있게 반드시 알려 줍니다.
+    latencySamples = fftSize;
+    setLatencySamples (latencySamples);
 
-    reverbTank.prepare (sampleRateHz);
+    // overlap ring은 현재 읽는 위치보다 미래에 2048 샘플짜리 프레임을 계속 더해야
+    // 하므로 FFT 크기보다 넉넉하게 둡니다. 실시간 처리 중 재할당하지 않습니다.
+    overlapRingSize = fftSize * 4;
+
+    for (auto& channel : mainChannelState)
+        channel.prepare (overlapRingSize, latencySamples);
+
     resetSmoothers();
     clearDspState();
 }
 
-void JuiceReverbAudioProcessor::releaseResources()
+void JuiceEQAudioProcessor::releaseResources()
 {
     clearDspState();
 }
 
 #ifndef JucePlugin_PreferredChannelConfigurations
 
-bool JuiceReverbAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+bool JuiceEQAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
+    const auto mainInput = layouts.getMainInputChannelSet();
     const auto mainOutput = layouts.getMainOutputChannelSet();
 
     if (mainOutput != juce::AudioChannelSet::mono()
@@ -198,9 +194,19 @@ bool JuiceReverbAudioProcessor::isBusesLayoutSupported (const BusesLayout& layou
         return false;
 
    #if ! JucePlugin_IsSynth
-    if (mainOutput != layouts.getMainInputChannelSet())
+    if (mainInput != mainOutput)
         return false;
    #endif
+
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto sidechainLayout = layouts.getChannelSet (true, 1);
+
+        if (! sidechainLayout.isDisabled()
+            && sidechainLayout != juce::AudioChannelSet::mono()
+            && sidechainLayout != juce::AudioChannelSet::stereo())
+            return false;
+    }
 
     return true;
 }
@@ -208,154 +214,157 @@ bool JuiceReverbAudioProcessor::isBusesLayoutSupported (const BusesLayout& layou
 #endif
 
 //==============================================================================
-void JuiceReverbAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
-                                              juce::MidiBuffer& midiMessages)
+void JuiceEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+                                          juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
     juce::ScopedNoDenormals noDenormals;
 
-    const int numInputChannels = getTotalNumInputChannels();
-    const int numOutputChannels = getTotalNumOutputChannels();
-    const int numSamples = buffer.getNumSamples();
-    const int channelsToProcess = juce::jmin (2, juce::jmin (numInputChannels, numOutputChannels));
+    auto mainInputBuffer = getBusBuffer (buffer, true, 0);
+    auto mainOutputBuffer = getBusBuffer (buffer, false, 0);
 
-    for (int channel = numInputChannels; channel < numOutputChannels; ++channel)
-        buffer.clear (channel, 0, numSamples);
+    const int numSamples = mainOutputBuffer.getNumSamples();
+    const int numMainInputChannels = mainInputBuffer.getNumChannels();
+    const int numMainOutputChannels = mainOutputBuffer.getNumChannels();
+    const int numMainChannels = juce::jmin (maximumAudioChannels,
+                                            juce::jmin (numMainInputChannels, numMainOutputChannels));
 
-    if (channelsToProcess <= 0 || numSamples <= 0)
+    for (int channel = numMainChannels; channel < numMainOutputChannels; ++channel)
+        mainOutputBuffer.clear (channel, 0, numSamples);
+
+    if (numMainChannels <= 0 || numSamples <= 0)
         return;
 
-    mixSmoother.setTargetValue (getParameterValue (ParameterIDs::mix) / 100.0f);
-    decaySmoother.setTargetValue (getParameterValue (ParameterIDs::decay));
-    sizeSmoother.setTargetValue (getParameterValue (ParameterIDs::size) / 100.0f);
-    preDelaySmoother.setTargetValue (getParameterValue (ParameterIDs::preDelay));
-    lowCutSmoother.setTargetValue (getParameterValue (ParameterIDs::lowCut));
-    duckingSmoother.setTargetValue (getParameterValue (ParameterIDs::ducking) / 100.0f);
-    saturationSmoother.setTargetValue (getParameterValue (ParameterIDs::saturation) / 100.0f);
-    widthSmoother.setTargetValue (getParameterValue (ParameterIDs::width) / 100.0f);
-    dampingSmoother.setTargetValue (getParameterValue (ParameterIDs::damping) / 100.0f);
+    const bool sidechainParameterEnabled = getParameterValue (ParameterIDs::sidechain) > 0.5f;
+    const bool deltaEnabled = getParameterValue (ParameterIDs::delta) > 0.5f;
 
-    const float attackCoefficient = std::exp (-1.0f / static_cast<float> (0.004 * sampleRateHz));
-    const float releaseCoefficient = std::exp (-1.0f / static_cast<float> (0.180 * sampleRateHz));
+    std::array<const float*, maximumAudioChannels> sidechainReadPointers {};
+    bool sidechainBusAvailable = false;
+    int numSidechainChannels = 0;
 
-    float blockMeter = 0.0f;
-    float lastDuckingDepth = 0.0f;
+    if (getBusCount (true) > 1)
+    {
+        if (auto* sidechainBus = getBus (true, 1))
+        {
+            if (sidechainBus->isEnabled())
+            {
+                auto sidechainBuffer = getBusBuffer (buffer, true, 1);
+                numSidechainChannels = juce::jmin (maximumAudioChannels, sidechainBuffer.getNumChannels());
+                sidechainBusAvailable = numSidechainChannels > 0;
+
+                for (int channel = 0; channel < numSidechainChannels; ++channel)
+                    sidechainReadPointers[static_cast<size_t> (channel)] =
+                        sidechainBuffer.getReadPointer (channel);
+            }
+        }
+    }
+
+    depthSmoother.setTargetValue (normalisedParameter (getParameterValue (ParameterIDs::depth)));
+    sharpnessSmoother.setTargetValue (normalisedParameter (getParameterValue (ParameterIDs::sharpness)));
+    selectivitySmoother.setTargetValue (normalisedParameter (getParameterValue (ParameterIDs::selectivity)));
+    softHardSmoother.setTargetValue (normalisedParameter (getParameterValue (ParameterIDs::softHard)));
+    mixSmoother.setTargetValue (normalisedParameter (getParameterValue (ParameterIDs::mix)));
+
+    FrameParameters frameParameters;
 
     for (int sample = 0; sample < numSamples; ++sample)
     {
-        const float dryLeft = buffer.getSample (0, sample);
-        const float dryRight = channelsToProcess > 1 ? buffer.getSample (1, sample) : dryLeft;
+        frameParameters.depth = depthSmoother.getNextValue();
+        frameParameters.sharpness = sharpnessSmoother.getNextValue();
+        frameParameters.selectivity = selectivitySmoother.getNextValue();
+        frameParameters.softHard = softHardSmoother.getNextValue();
 
-        const float mix = juce::jlimit (0.0f, 1.0f, mixSmoother.getNextValue());
-        const float decaySeconds = decaySmoother.getNextValue();
-        const float size = juce::jlimit (0.0f, 1.0f, sizeSmoother.getNextValue());
-        const float preDelayMs = preDelaySmoother.getNextValue();
-        const float lowCutHz = lowCutSmoother.getNextValue();
-        const float ducking = juce::jlimit (0.0f, 1.0f, duckingSmoother.getNextValue());
-        const float saturation = juce::jlimit (0.0f, 1.0f, saturationSmoother.getNextValue());
-        const float width = juce::jlimit (0.5f, 2.0f, widthSmoother.getNextValue());
-        const float damping = juce::jlimit (0.0f, 1.0f, dampingSmoother.getNextValue());
+        const float mix = mixSmoother.getNextValue();
+        const bool useSidechainThisSample = sidechainParameterEnabled && numSidechainChannels > 0;
 
-        // decaySeconds를 직접 feedback으로 쓰면 불안정해질 수 있으므로 안전한 범위로 변환합니다.
-        const float decayNormalised = juce::jlimit (0.0f, 1.0f, (decaySeconds - 0.5f) / 11.5f);
-        const float feedback = juce::jlimit (0.62f, 0.965f,
-                                             0.62f + decayNormalised * 0.285f + size * 0.06f);
+        std::array<float, maximumAudioChannels> dryDelayed {};
+        std::array<float, maximumAudioChannels> processedDelayed {};
+        std::array<float, maximumAudioChannels> deltaDelayed {};
 
-        const int preDelaySamples = juce::jlimit (
-            0,
-            maxPreDelaySamples - 1,
-            static_cast<int> (preDelayMs * 0.001f * static_cast<float> (sampleRateHz)));
-
-        // Dry를 바로 리버브에 넣지 않고 프리딜레이를 거칩니다.
-        // 이렇게 하면 원음의 첫 타격감이 앞으로 살아 있습니다.
-        const float preDelayedLeft = processPreDelay (0, dryLeft, preDelaySamples);
-        const float preDelayedRight = processPreDelay (1, dryRight, preDelaySamples);
-        advancePreDelay();
-
-        float wetLeft = 0.0f;
-        float wetRight = 0.0f;
-        reverbTank.process (preDelayedLeft, preDelayedRight, feedback, damping, size, wetLeft, wetRight);
-
-        wetLeft = saturateSample (wetLeft, saturation);
-        wetRight = saturateSample (wetRight, saturation);
-
-        // 리버브에만 12dB/oct 정도의 로우컷을 적용합니다.
-        // 원음 저역은 건드리지 않으므로 킥과 베이스의 중심이 덜 무너집니다.
-        const float highPassCoefficient = calculateHighPassCoefficient (lowCutHz, sampleRateHz);
-        wetLeft = processHighPass (lowCutStageA[0], wetLeft, highPassCoefficient);
-        wetLeft = processHighPass (lowCutStageB[0], wetLeft, highPassCoefficient);
-        wetRight = processHighPass (lowCutStageA[1], wetRight, highPassCoefficient);
-        wetRight = processHighPass (lowCutStageB[1], wetRight, highPassCoefficient);
-
-        // Wet 전용 Mid-Side Width입니다.
-        // Dry에는 적용하지 않으므로 원음의 중앙 이미지는 더 안정적입니다.
-        const float mid = (wetLeft + wetRight) * 0.5f;
-        const float side = (wetLeft - wetRight) * 0.5f * width;
-        wetLeft = mid + side;
-        wetRight = mid - side;
-
-        // Internal Ducking:
-        // 입력이 커지면 wet만 내려서 보컬/리드/킥의 앞부분이 리버브에 묻히지 않게 합니다.
-        const float inputPeak = juce::jmax (std::abs (dryLeft), std::abs (dryRight));
-
-        if (inputPeak > duckingEnvelope)
-            duckingEnvelope = attackCoefficient * duckingEnvelope + (1.0f - attackCoefficient) * inputPeak;
-        else
-            duckingEnvelope = releaseCoefficient * duckingEnvelope + (1.0f - releaseCoefficient) * inputPeak;
-
-        const float duckingDetector = smoothStep (juce::jlimit (0.0f, 1.0f, (duckingEnvelope - 0.035f) / 0.40f));
-        const float duckingGain = juce::jlimit (minimumDuckingGain, 1.0f,
-                                                1.0f - ducking * duckingDetector * 0.72f);
-
-        lastDuckingDepth = 1.0f - duckingGain;
-
-        // Equal-power에 가까운 dry/wet 크로스페이드입니다.
-        const float dryGain = std::cos (mix * juce::MathConstants<float>::halfPi);
-        const float wetGain = std::sin (mix * juce::MathConstants<float>::halfPi) * duckingGain;
-
-        float outputLeft = dryLeft * dryGain + wetLeft * wetGain;
-        float outputRight = dryRight * dryGain + wetRight * wetGain;
-
-        outputLeft = softLimitSample (outputLeft);
-        outputRight = softLimitSample (outputRight);
-
-        if (channelsToProcess > 1)
+        for (int channel = 0; channel < numMainChannels; ++channel)
         {
-            buffer.setSample (0, sample, outputLeft);
-            buffer.setSample (1, sample, outputRight);
-        }
-        else
-        {
-            buffer.setSample (0, sample, (outputLeft + outputRight) * 0.5f);
+            const float input = mainInputBuffer.getSample (channel, sample);
+
+            dryDelayed[static_cast<size_t> (channel)] = readDryDelayThenStoreInput (channel, input);
+            processedDelayed[static_cast<size_t> (channel)] = readAndClearProcessedSample (channel);
+            deltaDelayed[static_cast<size_t> (channel)] = readAndClearDeltaSample (channel);
+
+            pushMainSample (channel, input);
         }
 
-        blockMeter = juce::jmax (blockMeter, std::abs (wetLeft * wetGain));
-        blockMeter = juce::jmax (blockMeter, std::abs (wetRight * wetGain));
+        // mono 입력일 때도 두 번째 내부 상태를 깨끗하게 유지합니다.
+        for (int channel = numMainChannels; channel < maximumAudioChannels; ++channel)
+        {
+            readDryDelayThenStoreInput (channel, 0.0f);
+            readAndClearProcessedSample (channel);
+            readAndClearDeltaSample (channel);
+            pushMainSample (channel, 0.0f);
+        }
+
+        for (int channel = 0; channel < maximumAudioChannels; ++channel)
+        {
+            float sidechainSample = 0.0f;
+
+            if (sidechainBusAvailable)
+            {
+                const int sourceChannel = channel < numSidechainChannels ? channel : 0;
+
+                if (const float* source = sidechainReadPointers[static_cast<size_t> (sourceChannel)])
+                    sidechainSample = source[sample];
+            }
+
+            pushSidechainSample (channel, sidechainSample);
+        }
+
+        ++samplesSinceLastFrame;
+
+        if (samplesSinceLastFrame >= hopSize)
+        {
+            samplesSinceLastFrame = 0;
+            processSpectralFrame (numMainChannels,
+                                  numSidechainChannels,
+                                  useSidechainThisSample,
+                                  frameParameters);
+        }
+
+        for (int channel = 0; channel < numMainChannels; ++channel)
+        {
+            float output = 0.0f;
+
+            if (deltaEnabled)
+            {
+                // Delta 모드는 "Input - Processed"를 실시간으로 새로 계산하는 방식이 아닙니다.
+                // FFT bin에서 gain 때문에 제거된 성분만 별도로 inverse FFT/OLA한 신호를 냅니다.
+                output = deltaDelayed[static_cast<size_t> (channel)];
+            }
+            else
+            {
+                const float dry = dryDelayed[static_cast<size_t> (channel)];
+                const float wet = processedDelayed[static_cast<size_t> (channel)];
+                output = dry + (wet - dry) * mix;
+            }
+
+            mainOutputBuffer.setSample (channel, sample, softLimitSample (output));
+        }
+
+        for (int channel = 0; channel < maximumAudioChannels; ++channel)
+            advanceChannelCursors (channel);
     }
-
-    const float previousMeter = visualLevel.load();
-    const float targetMeter = juce::jlimit (0.0f, 1.0f, blockMeter * 2.2f);
-    const float smoothedMeter = targetMeter > previousMeter
-        ? targetMeter
-        : previousMeter * 0.86f + targetMeter * 0.14f;
-
-    visualLevel.store (smoothedMeter);
-    visualDuckingDepth.store (juce::jlimit (0.0f, 1.0f, lastDuckingDepth));
 }
 
 //==============================================================================
-bool JuiceReverbAudioProcessor::hasEditor() const
+bool JuiceEQAudioProcessor::hasEditor() const
 {
     return true;
 }
 
-juce::AudioProcessorEditor* JuiceReverbAudioProcessor::createEditor()
+juce::AudioProcessorEditor* JuiceEQAudioProcessor::createEditor()
 {
-    return new JuiceReverbAudioProcessorEditor (*this);
+    return new JuiceEQAudioProcessorEditor (*this);
 }
 
 //==============================================================================
-void JuiceReverbAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+void JuiceEQAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
@@ -366,7 +375,7 @@ void JuiceReverbAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         destData.setSize (0);
 }
 
-void JuiceReverbAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void JuiceEQAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (data == nullptr || sizeInBytes <= 0)
         return;
@@ -378,17 +387,38 @@ void JuiceReverbAudioProcessor::setStateInformation (const void* data, int sizeI
 }
 
 //==============================================================================
-float JuiceReverbAudioProcessor::getVisualLevel() const noexcept
+void JuiceEQAudioProcessor::copySpectrumReductionData (float* destination,
+                                                       int destinationSize) const noexcept
+{
+    if (destination == nullptr || destinationSize <= 0)
+        return;
+
+    const int count = juce::jmin (destinationSize, visualizerBinCount);
+
+    for (int index = 0; index < count; ++index)
+        destination[index] = visualReduction[static_cast<size_t> (index)].load();
+
+    for (int index = count; index < destinationSize; ++index)
+        destination[index] = 0.0f;
+}
+
+float JuiceEQAudioProcessor::getVisualLevel() const noexcept
 {
     return visualLevel.load();
 }
 
-float JuiceReverbAudioProcessor::getDuckingDepth() const noexcept
+float JuiceEQAudioProcessor::getDuckingDepth() const noexcept
 {
-    return visualDuckingDepth.load();
+    return averageSuppression.load();
 }
 
-float JuiceReverbAudioProcessor::getParameterValue (const char* parameterID) const noexcept
+float JuiceEQAudioProcessor::getAverageSuppression() const noexcept
+{
+    return averageSuppression.load();
+}
+
+//==============================================================================
+float JuiceEQAudioProcessor::getParameterValue (const char* parameterID) const noexcept
 {
     if (auto* value = apvts.getRawParameterValue (parameterID))
         return value->load();
@@ -397,298 +427,573 @@ float JuiceReverbAudioProcessor::getParameterValue (const char* parameterID) con
     return 0.0f;
 }
 
-void JuiceReverbAudioProcessor::resetSmoothers()
+void JuiceEQAudioProcessor::resetSmoothers()
 {
-    auto initialise = [this] (auto& smoother, const char* parameterID, float scale)
+    auto initialise = [this] (auto& smoother, const char* parameterID)
     {
         smoother.reset (sampleRateHz, 0.045);
-        smoother.setCurrentAndTargetValue (getParameterValue (parameterID) * scale);
+        smoother.setCurrentAndTargetValue (normalisedParameter (getParameterValue (parameterID)));
     };
 
-    initialise (mixSmoother,        ParameterIDs::mix,        0.01f);
-    initialise (decaySmoother,      ParameterIDs::decay,      1.0f);
-    initialise (sizeSmoother,       ParameterIDs::size,       0.01f);
-    initialise (preDelaySmoother,   ParameterIDs::preDelay,   1.0f);
-    initialise (lowCutSmoother,     ParameterIDs::lowCut,     1.0f);
-    initialise (duckingSmoother,    ParameterIDs::ducking,    0.01f);
-    initialise (saturationSmoother, ParameterIDs::saturation, 0.01f);
-    initialise (widthSmoother,      ParameterIDs::width,      0.01f);
-    initialise (dampingSmoother,    ParameterIDs::damping,    0.01f);
+    initialise (depthSmoother,       ParameterIDs::depth);
+    initialise (sharpnessSmoother,   ParameterIDs::sharpness);
+    initialise (selectivitySmoother, ParameterIDs::selectivity);
+    initialise (softHardSmoother,    ParameterIDs::softHard);
+    initialise (mixSmoother,         ParameterIDs::mix);
 }
 
-void JuiceReverbAudioProcessor::clearDspState()
+void JuiceEQAudioProcessor::clearDspState()
 {
-    reverbTank.clear();
-    preDelayBuffer.clear();
-    preDelayWritePosition = 0;
-    duckingEnvelope = 0.0f;
+    for (auto& channel : mainChannelState)
+        channel.clear();
 
-    for (auto& state : lowCutStageA)
-        state.clear();
+    for (auto& channel : sidechainChannelState)
+        channel.clear();
 
-    for (auto& state : lowCutStageB)
-        state.clear();
+    mainMagnitudeDb.fill (minimumDecibels);
+    sidechainMagnitudeDb.fill (minimumDecibels);
+    mainLocalAverageDb.fill (minimumDecibels);
+    sidechainLocalAverageDb.fill (minimumDecibels);
+    rawReduction.fill (0.0f);
+    spreadReduction.fill (0.0f);
+    smoothedReduction.fill (0.0f);
+    binGain.fill (1.0f);
 
+    samplesSinceLastFrame = 0;
     visualLevel.store (0.0f);
-    visualDuckingDepth.store (0.0f);
+    averageSuppression.store (0.0f);
+
+    for (auto& value : visualReduction)
+        value.store (0.0f);
 }
 
-float JuiceReverbAudioProcessor::processPreDelay (int channel, float input, int delaySamples) noexcept
+void JuiceEQAudioProcessor::initialiseWindow() noexcept
 {
-    if (preDelayBuffer.getNumSamples() <= 0)
+    for (int index = 0; index < fftSize; ++index)
+    {
+        // periodic Hann: 0.5 - 0.5*cos(2*pi*n/N)
+        // sqrt를 씌우면 분석/합성에 같은 윈도우를 써도 곱은 Hann이 됩니다.
+        const float phase = juce::MathConstants<float>::twoPi
+                            * static_cast<float> (index)
+                            / static_cast<float> (fftSize);
+
+        const float hann = 0.5f - 0.5f * std::cos (phase);
+        sqrtHannWindow[static_cast<size_t> (index)] = std::sqrt (juce::jmax (0.0f, hann));
+    }
+}
+
+//==============================================================================
+void JuiceEQAudioProcessor::pushMainSample (int channel, float sample) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    state.inputRing[static_cast<size_t> (state.inputWriteIndex)] = std::isfinite (sample) ? sample : 0.0f;
+    state.inputWriteIndex = (state.inputWriteIndex + 1) % fftSize;
+}
+
+void JuiceEQAudioProcessor::pushSidechainSample (int channel, float sample) noexcept
+{
+    auto& state = sidechainChannelState[static_cast<size_t> (channel)];
+
+    state.inputRing[static_cast<size_t> (state.inputWriteIndex)] = std::isfinite (sample) ? sample : 0.0f;
+    state.inputWriteIndex = (state.inputWriteIndex + 1) % fftSize;
+}
+
+float JuiceEQAudioProcessor::readDryDelayThenStoreInput (int channel, float input) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    if (state.dryDelay.empty())
         return input;
 
-    const int safeChannel = juce::jlimit (0, preDelayBuffer.getNumChannels() - 1, channel);
-    const int bufferSize = preDelayBuffer.getNumSamples();
-
-    int readPosition = preDelayWritePosition - delaySamples;
-
-    while (readPosition < 0)
-        readPosition += bufferSize;
-
-    const float output = preDelayBuffer.getSample (safeChannel, readPosition);
-    preDelayBuffer.setSample (safeChannel, preDelayWritePosition, input);
+    const size_t index = static_cast<size_t> (state.dryDelayIndex);
+    const float output = state.dryDelay[index];
+    state.dryDelay[index] = std::isfinite (input) ? input : 0.0f;
 
     return output;
 }
 
-void JuiceReverbAudioProcessor::advancePreDelay() noexcept
+float JuiceEQAudioProcessor::readAndClearProcessedSample (int channel) noexcept
 {
-    if (preDelayBuffer.getNumSamples() <= 0)
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    if (state.processedOverlap.empty())
+        return 0.0f;
+
+    const size_t index = static_cast<size_t> (state.overlapReadIndex);
+    const float output = state.processedOverlap[index];
+    state.processedOverlap[index] = 0.0f;
+
+    return output;
+}
+
+float JuiceEQAudioProcessor::readAndClearDeltaSample (int channel) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    if (state.deltaOverlap.empty())
+        return 0.0f;
+
+    const size_t index = static_cast<size_t> (state.overlapReadIndex);
+    const float output = state.deltaOverlap[index];
+    state.deltaOverlap[index] = 0.0f;
+
+    return output;
+}
+
+void JuiceEQAudioProcessor::advanceChannelCursors (int channel) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    if (! state.dryDelay.empty())
+        state.dryDelayIndex = (state.dryDelayIndex + 1) % static_cast<int> (state.dryDelay.size());
+
+    if (! state.processedOverlap.empty())
+        state.overlapReadIndex = (state.overlapReadIndex + 1) % static_cast<int> (state.processedOverlap.size());
+}
+
+//==============================================================================
+void JuiceEQAudioProcessor::processSpectralFrame (int numMainChannels,
+                                                  int numSidechainChannels,
+                                                  bool useSidechain,
+                                                  const FrameParameters& parameters) noexcept
+{
+    buildMagnitudeAnalysis (numMainChannels, numSidechainChannels, useSidechain);
+    calculateReductionCurve (useSidechain, parameters);
+
+    for (int channel = 0; channel < numMainChannels; ++channel)
+        renderChannelFrame (channel);
+
+    updateVisualizerData();
+}
+
+void JuiceEQAudioProcessor::buildMagnitudeAnalysis (int numMainChannels,
+                                                    int numSidechainChannels,
+                                                    bool analyseSidechain) noexcept
+{
+    std::array<float, numFrequencyBins> mainLinear {};
+    std::array<float, numFrequencyBins> sidechainLinear {};
+
+    const int safeMainChannels = juce::jlimit (1, maximumAudioChannels, numMainChannels);
+
+    for (int channel = 0; channel < safeMainChannels; ++channel)
+    {
+        const auto& state = mainChannelState[static_cast<size_t> (channel)];
+        fillFftDataFromRing (state.inputRing, state.inputWriteIndex);
+
+        fft.performRealOnlyForwardTransform (fftData.data(), true);
+
+        for (int bin = 0; bin < numFrequencyBins; ++bin)
+        {
+            const float real = fftData[static_cast<size_t> (bin * 2)];
+            const float imaginary = fftData[static_cast<size_t> (bin * 2 + 1)];
+            const float scale = (bin == 0 || bin == numFrequencyBins - 1) ? 1.0f : 2.0f;
+            const float magnitude = std::sqrt (real * real + imaginary * imaginary)
+                                    * scale
+                                    / static_cast<float> (fftSize);
+
+            mainLinear[static_cast<size_t> (bin)] += magnitude;
+        }
+    }
+
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        const float averagedMagnitude = mainLinear[static_cast<size_t> (bin)]
+                                        / static_cast<float> (safeMainChannels);
+        mainMagnitudeDb[static_cast<size_t> (bin)] = safeDecibels (averagedMagnitude);
+    }
+
+    if (analyseSidechain && numSidechainChannels > 0)
+    {
+        const int safeSidechainChannels = juce::jlimit (1, maximumAudioChannels, numSidechainChannels);
+
+        for (int channel = 0; channel < safeSidechainChannels; ++channel)
+        {
+            const auto& state = sidechainChannelState[static_cast<size_t> (channel)];
+            fillFftDataFromRing (state.inputRing, state.inputWriteIndex);
+
+            fft.performRealOnlyForwardTransform (fftData.data(), true);
+
+            for (int bin = 0; bin < numFrequencyBins; ++bin)
+            {
+                const float real = fftData[static_cast<size_t> (bin * 2)];
+                const float imaginary = fftData[static_cast<size_t> (bin * 2 + 1)];
+                const float scale = (bin == 0 || bin == numFrequencyBins - 1) ? 1.0f : 2.0f;
+                const float magnitude = std::sqrt (real * real + imaginary * imaginary)
+                                        * scale
+                                        / static_cast<float> (fftSize);
+
+                sidechainLinear[static_cast<size_t> (bin)] += magnitude;
+            }
+        }
+
+        for (int bin = 0; bin < numFrequencyBins; ++bin)
+        {
+            const float averagedMagnitude = sidechainLinear[static_cast<size_t> (bin)]
+                                            / static_cast<float> (safeSidechainChannels);
+            sidechainMagnitudeDb[static_cast<size_t> (bin)] = safeDecibels (averagedMagnitude);
+        }
+    }
+    else
+    {
+        sidechainMagnitudeDb.fill (minimumDecibels);
+    }
+}
+
+void JuiceEQAudioProcessor::calculateReductionCurve (bool useSidechain,
+                                                     const FrameParameters& parameters) noexcept
+{
+    const float depth = juce::jlimit (0.0f, 1.0f, parameters.depth);
+    const float sharpness = juce::jlimit (0.0f, 1.0f, parameters.sharpness);
+    const float selectivity = juce::jlimit (0.0f, 1.0f, parameters.selectivity);
+    const float hardness = juce::jlimit (0.0f, 1.0f, parameters.softHard);
+
+    // 주변 평균을 계산할 때 보는 bin 범위입니다.
+    // selectivity가 낮으면 더 넓은 문맥에서 "튀어나옴"을 찾고,
+    // selectivity가 높으면 더 까다롭게 좁은 문제 대역만 봅니다.
+    const int averageRadius = juce::jlimit (4, 96,
+        static_cast<int> (std::round (juce::jmap (selectivity, 72.0f, 18.0f))));
+
+    smoothAcrossFrequency (mainMagnitudeDb, mainLocalAverageDb, averageRadius);
+
+    if (useSidechain)
+        smoothAcrossFrequency (sidechainMagnitudeDb, sidechainLocalAverageDb, averageRadius);
+    else
+        sidechainLocalAverageDb.fill (minimumDecibels);
+
+    const float resonanceThresholdDb = juce::jmap (selectivity, 2.0f, 11.5f);
+    const float resonanceRangeDb = juce::jmap (selectivity, 24.0f, 14.0f);
+
+    float sidechainPeakDb = minimumDecibels;
+
+    if (useSidechain)
+    {
+        for (float value : sidechainMagnitudeDb)
+            sidechainPeakDb = juce::jmax (sidechainPeakDb, value);
+    }
+
+    const bool sidechainHasSignal = useSidechain && sidechainPeakDb > -95.0f;
+
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        const float frequency = binToFrequency (bin, sampleRateHz);
+
+        if (frequency < minimumUsefulFrequency || frequency > static_cast<float> (sampleRateHz * 0.485))
+        {
+            rawReduction[static_cast<size_t> (bin)] = 0.0f;
+            continue;
+        }
+
+        const float mainDb = mainMagnitudeDb[static_cast<size_t> (bin)];
+        const float localDb = mainLocalAverageDb[static_cast<size_t> (bin)];
+
+        // 주변 대역보다 얼마나 튀어나왔는지입니다.
+        // 예: mainDb가 -20 dB이고 주변 평균이 -32 dB면 protrusion은 12 dB입니다.
+        const float protrusionDb = mainDb - localDb;
+        const float audibleMain = smoothStep ((mainDb + 92.0f) / 52.0f);
+
+        float resonanceAmount = (protrusionDb - resonanceThresholdDb) / resonanceRangeDb;
+        resonanceAmount = smoothStep (juce::jlimit (0.0f, 1.0f, resonanceAmount));
+
+        // Soft에서는 강한 공진에만 천천히 반응하고, Hard에서는 작은 돌출도 빠르게 잡습니다.
+        const float kneeExponent = juce::jmap (hardness, 1.75f, 0.56f);
+        resonanceAmount = std::pow (resonanceAmount, kneeExponent) * audibleMain;
+
+        float targetAmount = resonanceAmount;
+
+        if (sidechainHasSignal)
+        {
+            const float sidechainDb = sidechainMagnitudeDb[static_cast<size_t> (bin)];
+            const float sidechainLocalDb = sidechainLocalAverageDb[static_cast<size_t> (bin)];
+
+            // 사이드체인은 "공진"만 찾는 것이 아니라, 외부 신호가 실제로 차지하는
+            // 주파수 윤곽을 메인에서 비우는 용도입니다. 그래서 절대 에너지와
+            // 주변 대비 돌출을 함께 봅니다.
+            const float sidechainRelativeToPeak = (sidechainDb - (sidechainPeakDb - 42.0f)) / 42.0f;
+            const float sidechainProminence = (sidechainDb - sidechainLocalDb + 4.0f) / 26.0f;
+            const float sidechainAudible = smoothStep ((sidechainDb + 96.0f) / 54.0f);
+
+            const float sidechainMask = juce::jmax (
+                smoothStep (juce::jlimit (0.0f, 1.0f, sidechainRelativeToPeak)) * 0.78f,
+                smoothStep (juce::jlimit (0.0f, 1.0f, sidechainProminence)) * 0.52f);
+
+            targetAmount = juce::jmax (targetAmount, sidechainMask * sidechainAudible * audibleMain);
+        }
+
+        rawReduction[static_cast<size_t> (bin)] = juce::jlimit (0.0f, 1.0f, targetAmount);
+    }
+
+    // sharpness가 낮으면 넓게, 높으면 좁게 퍼뜨립니다.
+    // max 기반으로 퍼뜨리는 이유는 강한 공진 하나가 주변 bin까지 자연스럽게 영향을 줘야 하고,
+    // 단순 평균 blur는 peak를 너무 희석하기 때문입니다.
+    const int spreadRadius = juce::jlimit (1, 34,
+        static_cast<int> (std::round (juce::jmap (sharpness, 28.0f, 2.0f))));
+    const float sigma = juce::jmax (1.0f, static_cast<float> (spreadRadius) * 0.44f);
+
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        float maximumWeightedReduction = 0.0f;
+
+        const int firstBin = juce::jmax (0, bin - spreadRadius);
+        const int lastBin = juce::jmin (numFrequencyBins - 1, bin + spreadRadius);
+
+        for (int neighbour = firstBin; neighbour <= lastBin; ++neighbour)
+        {
+            const float distance = static_cast<float> (neighbour - bin);
+            const float weight = std::exp (-0.5f * (distance * distance) / (sigma * sigma));
+            maximumWeightedReduction = juce::jmax (
+                maximumWeightedReduction,
+                rawReduction[static_cast<size_t> (neighbour)] * weight);
+        }
+
+        spreadReduction[static_cast<size_t> (bin)] = maximumWeightedReduction;
+    }
+
+    const float attack = juce::jmap (hardness, 0.48f, 0.78f);
+    const float release = juce::jmap (hardness, 0.10f, 0.22f);
+    const float maximumReductionDb = juce::jmap (depth, 0.0f, 42.0f);
+
+    float sumReduction = 0.0f;
+    float peakReduction = 0.0f;
+
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        const float target = spreadReduction[static_cast<size_t> (bin)];
+        float current = smoothedReduction[static_cast<size_t> (bin)];
+
+        current += (target - current) * (target > current ? attack : release);
+        current = juce::jlimit (0.0f, 1.0f, current);
+
+        smoothedReduction[static_cast<size_t> (bin)] = current;
+
+        const float gain = juce::Decibels::decibelsToGain (-maximumReductionDb * current);
+        binGain[static_cast<size_t> (bin)] = juce::jlimit (0.02f, 1.0f, gain);
+
+        const float removed = 1.0f - binGain[static_cast<size_t> (bin)];
+        sumReduction += removed;
+        peakReduction = juce::jmax (peakReduction, removed);
+    }
+
+    averageSuppression.store (juce::jlimit (0.0f, 1.0f, sumReduction / static_cast<float> (numFrequencyBins)));
+    visualLevel.store (juce::jlimit (0.0f, 1.0f, peakReduction));
+}
+
+void JuiceEQAudioProcessor::renderChannelFrame (int channel) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    fillFftDataFromRing (state.inputRing, state.inputWriteIndex);
+    fft.performRealOnlyForwardTransform (fftData.data(), true);
+
+    deltaFftData.fill (0.0f);
+
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        const size_t realIndex = static_cast<size_t> (bin * 2);
+        const size_t imaginaryIndex = static_cast<size_t> (bin * 2 + 1);
+
+        const float real = fftData[realIndex];
+        const float imaginary = fftData[imaginaryIndex];
+        const float gain = binGain[static_cast<size_t> (bin)];
+        const float removedGain = 1.0f - gain;
+
+        fftData[realIndex] = real * gain;
+        fftData[imaginaryIndex] = imaginary * gain;
+
+        deltaFftData[realIndex] = real * removedGain;
+        deltaFftData[imaginaryIndex] = imaginary * removedGain;
+    }
+
+    fft.performRealOnlyInverseTransform (fftData.data());
+    fft.performRealOnlyInverseTransform (deltaFftData.data());
+
+    addFrameToOverlapBuffers (channel);
+}
+
+void JuiceEQAudioProcessor::addFrameToOverlapBuffers (int channel) noexcept
+{
+    auto& state = mainChannelState[static_cast<size_t> (channel)];
+
+    if (state.processedOverlap.empty() || state.deltaOverlap.empty())
         return;
 
-    preDelayWritePosition = (preDelayWritePosition + 1) % preDelayBuffer.getNumSamples();
+    // 현재 sample의 output slot은 이미 읽고 지웠으므로, 새 프레임은 반드시 다음
+    // sample 위치부터 더합니다. 이 스케줄링 때문에 전체 지연은 정확히 fftSize입니다.
+    int writeIndex = (state.overlapReadIndex + 1) % static_cast<int> (state.processedOverlap.size());
+
+    for (int sample = 0; sample < fftSize; ++sample)
+    {
+        const float synthesis = sqrtHannWindow[static_cast<size_t> (sample)] * overlapAddGain;
+
+        state.processedOverlap[static_cast<size_t> (writeIndex)] += fftData[static_cast<size_t> (sample)] * synthesis;
+        state.deltaOverlap[static_cast<size_t> (writeIndex)] += deltaFftData[static_cast<size_t> (sample)] * synthesis;
+
+        if (++writeIndex >= static_cast<int> (state.processedOverlap.size()))
+            writeIndex = 0;
+    }
 }
 
-float JuiceReverbAudioProcessor::processHighPass (HighPassState& state,
-                                                  float input,
-                                                  float coefficient) noexcept
+void JuiceEQAudioProcessor::updateVisualizerData() noexcept
 {
-    const float output = coefficient * (state.previousOutput + input - state.previousInput);
+    const float nyquist = static_cast<float> (sampleRateHz * 0.5);
+    const float maximumFrequency = juce::jmax (visualMinimumFrequency * 2.0f, nyquist * 0.98f);
 
-    state.previousInput = input;
-    state.previousOutput = output;
+    for (int visualBin = 0; visualBin < visualizerBinCount; ++visualBin)
+    {
+        const float startNormalised = static_cast<float> (visualBin)
+                                      / static_cast<float> (visualizerBinCount);
+        const float endNormalised = static_cast<float> (visualBin + 1)
+                                    / static_cast<float> (visualizerBinCount);
 
-    return output;
+        const float startFrequency = visualMinimumFrequency
+                                     * std::pow (maximumFrequency / visualMinimumFrequency, startNormalised);
+        const float endFrequency = visualMinimumFrequency
+                                   * std::pow (maximumFrequency / visualMinimumFrequency, endNormalised);
+
+        const int firstBin = frequencyToBin (startFrequency, sampleRateHz);
+        const int lastBin = juce::jmax (firstBin, frequencyToBin (endFrequency, sampleRateHz));
+
+        float peak = 0.0f;
+
+        for (int bin = firstBin; bin <= lastBin && bin < numFrequencyBins; ++bin)
+            peak = juce::jmax (peak, 1.0f - binGain[static_cast<size_t> (bin)]);
+
+        const float previous = visualReduction[static_cast<size_t> (visualBin)].load();
+        const float smoothed = peak > previous
+            ? peak
+            : previous * 0.82f + peak * 0.18f;
+
+        visualReduction[static_cast<size_t> (visualBin)].store (juce::jlimit (0.0f, 1.0f, smoothed));
+    }
 }
 
-float JuiceReverbAudioProcessor::calculateHighPassCoefficient (float cutoffHz, double sampleRate) noexcept
+void JuiceEQAudioProcessor::fillFftDataFromRing (const std::array<float, fftSize>& ring,
+                                                 int writeIndex) noexcept
 {
-    const float safeCutoff = juce::jlimit (20.0f, static_cast<float> (sampleRate * 0.45), cutoffHz);
-    const float dt = 1.0f / static_cast<float> (sampleRate);
-    const float rc = 1.0f / (juce::MathConstants<float>::twoPi * safeCutoff);
+    // writeIndex는 다음에 쓸 위치, 즉 현재 프레임에서 가장 오래된 샘플 위치입니다.
+    // 여기서부터 끝까지 읽고, 다시 0번부터 writeIndex 직전까지 읽으면 시간 순서가 됩니다.
+    for (int sample = 0; sample < fftSize; ++sample)
+    {
+        const int ringIndex = (writeIndex + sample) % fftSize;
+        fftData[static_cast<size_t> (sample)] =
+            ring[static_cast<size_t> (ringIndex)] * sqrtHannWindow[static_cast<size_t> (sample)];
+    }
 
-    return rc / (rc + dt);
+    std::fill (fftData.begin() + fftSize, fftData.end(), 0.0f);
 }
 
-float JuiceReverbAudioProcessor::saturateSample (float input, float amount) noexcept
+void JuiceEQAudioProcessor::smoothAcrossFrequency (
+    const std::array<float, numFrequencyBins>& source,
+    std::array<float, numFrequencyBins>& destination,
+    int radius) const noexcept
 {
-    const float safeAmount = juce::jlimit (0.0f, 1.0f, amount);
+    const int safeRadius = juce::jlimit (1, 128, radius);
 
-    if (safeAmount <= 0.0001f)
-        return input;
+    for (int bin = 0; bin < numFrequencyBins; ++bin)
+    {
+        const int firstBin = juce::jmax (0, bin - safeRadius);
+        const int lastBin = juce::jmin (numFrequencyBins - 1, bin + safeRadius);
 
-    // tanh는 신호가 커질수록 부드럽게 눌러주는 곡선입니다.
-    // drive가 클수록 배음과 밀도가 늘어납니다.
-    const float drive = 1.0f + safeAmount * 3.2f;
-    const float shaped = std::tanh (input * drive) / std::tanh (drive);
+        float weightedSum = 0.0f;
+        float weightSum = 0.0f;
 
-    // 원본과 새추레이션 신호를 섞어서 지나치게 찌그러지는 것을 막습니다.
-    return input * (1.0f - safeAmount * 0.72f) + shaped * (safeAmount * 0.72f);
+        for (int neighbour = firstBin; neighbour <= lastBin; ++neighbour)
+        {
+            const float distance = std::abs (static_cast<float> (neighbour - bin))
+                                   / static_cast<float> (safeRadius);
+            const float weight = 1.0f - distance * 0.65f;
+
+            weightedSum += source[static_cast<size_t> (neighbour)] * weight;
+            weightSum += weight;
+        }
+
+        destination[static_cast<size_t> (bin)] =
+            weightSum > 0.0f ? weightedSum / weightSum : source[static_cast<size_t> (bin)];
+    }
 }
 
-float JuiceReverbAudioProcessor::softLimitSample (float input) noexcept
+//==============================================================================
+float JuiceEQAudioProcessor::softLimitSample (float input) noexcept
 {
     if (! std::isfinite (input))
         return 0.0f;
 
-    constexpr float ceiling = 0.985f;
+    constexpr float ceiling = 0.995f;
     return ceiling * std::tanh (input / ceiling);
 }
 
-float JuiceReverbAudioProcessor::smoothStep (float value) noexcept
+float JuiceEQAudioProcessor::smoothStep (float value) noexcept
 {
     const float x = juce::jlimit (0.0f, 1.0f, value);
     return x * x * (3.0f - 2.0f * x);
 }
 
-bool JuiceReverbAudioProcessor::isFiniteAndPositive (double value) noexcept
+float JuiceEQAudioProcessor::safeDecibels (float linearGain) noexcept
+{
+    if (! std::isfinite (linearGain) || linearGain <= 0.0f)
+        return minimumDecibels;
+
+    return juce::Decibels::gainToDecibels (linearGain, minimumDecibels);
+}
+
+float JuiceEQAudioProcessor::normalisedParameter (float percentValue) noexcept
+{
+    return juce::jlimit (0.0f, 1.0f, percentValue * 0.01f);
+}
+
+float JuiceEQAudioProcessor::binToFrequency (int bin, double sampleRate) noexcept
+{
+    return static_cast<float> (bin) * static_cast<float> (sampleRate) / static_cast<float> (fftSize);
+}
+
+int JuiceEQAudioProcessor::frequencyToBin (float frequency, double sampleRate) noexcept
+{
+    if (! isFiniteAndPositive (sampleRate))
+        return 0;
+
+    const float bin = frequency * static_cast<float> (fftSize) / static_cast<float> (sampleRate);
+    return juce::jlimit (0, numFrequencyBins - 1, static_cast<int> (std::floor (bin)));
+}
+
+bool JuiceEQAudioProcessor::isFiniteAndPositive (double value) noexcept
 {
     return std::isfinite (value) && value > 0.0;
 }
 
 //==============================================================================
-void JuiceReverbAudioProcessor::HighPassState::clear() noexcept
+void JuiceEQAudioProcessor::MainChannelState::prepare (int newOverlapRingSize,
+                                                       int latencySamples)
 {
-    previousInput = 0.0f;
-    previousOutput = 0.0f;
-}
+    const int safeOverlapSize = juce::jmax (fftSize * 2, newOverlapRingSize);
+    const int safeLatency = juce::jmax (1, latencySamples);
 
-//==============================================================================
-void JuiceReverbAudioProcessor::CombFilter::prepare (int delaySamples)
-{
-    delayBuffer.assign (static_cast<size_t> (juce::jmax (1, delaySamples)), 0.0f);
-    writeIndex = 0;
-    dampingMemory = 0.0f;
-}
+    dryDelay.assign (static_cast<size_t> (safeLatency), 0.0f);
+    processedOverlap.assign (static_cast<size_t> (safeOverlapSize), 0.0f);
+    deltaOverlap.assign (static_cast<size_t> (safeOverlapSize), 0.0f);
 
-void JuiceReverbAudioProcessor::CombFilter::clear() noexcept
-{
-    std::fill (delayBuffer.begin(), delayBuffer.end(), 0.0f);
-    writeIndex = 0;
-    dampingMemory = 0.0f;
-}
-
-float JuiceReverbAudioProcessor::CombFilter::process (float input,
-                                                      float feedback,
-                                                      float damping) noexcept
-{
-    if (delayBuffer.empty())
-        return input;
-
-    const float delayed = delayBuffer[static_cast<size_t> (writeIndex)];
-
-    // dampingMemory는 comb 내부 feedback의 고역을 조금씩 줄입니다.
-    // 값이 클수록 꼬리가 어두워지고 부드러워집니다.
-    dampingMemory = delayed * (1.0f - damping) + dampingMemory * damping;
-    delayBuffer[static_cast<size_t> (writeIndex)] = input + dampingMemory * feedback;
-
-    if (++writeIndex >= static_cast<int> (delayBuffer.size()))
-        writeIndex = 0;
-
-    return delayed;
-}
-
-//==============================================================================
-void JuiceReverbAudioProcessor::AllpassFilter::prepare (int delaySamples)
-{
-    delayBuffer.assign (static_cast<size_t> (juce::jmax (1, delaySamples)), 0.0f);
-    writeIndex = 0;
-}
-
-void JuiceReverbAudioProcessor::AllpassFilter::clear() noexcept
-{
-    std::fill (delayBuffer.begin(), delayBuffer.end(), 0.0f);
-    writeIndex = 0;
-}
-
-float JuiceReverbAudioProcessor::AllpassFilter::process (float input, float feedback) noexcept
-{
-    if (delayBuffer.empty())
-        return input;
-
-    const float delayed = delayBuffer[static_cast<size_t> (writeIndex)];
-    const float output = delayed - input;
-
-    delayBuffer[static_cast<size_t> (writeIndex)] = input + delayed * feedback;
-
-    if (++writeIndex >= static_cast<int> (delayBuffer.size()))
-        writeIndex = 0;
-
-    return output;
-}
-
-//==============================================================================
-void JuiceReverbAudioProcessor::ChannelReverbTank::prepare (double sampleRate, int stereoSpread)
-{
-    const double scale = sampleRate / referenceSampleRate;
-
-    for (size_t index = 0; index < combs.size(); ++index)
-    {
-        const int delay = static_cast<int> (std::round ((combTunings[index] + stereoSpread) * scale));
-        combs[index].prepare (delay);
-    }
-
-    for (size_t index = 0; index < allpasses.size(); ++index)
-    {
-        const int delay = static_cast<int> (std::round ((allpassTunings[index] + stereoSpread) * scale));
-        allpasses[index].prepare (delay);
-    }
-}
-
-void JuiceReverbAudioProcessor::ChannelReverbTank::clear() noexcept
-{
-    for (auto& comb : combs)
-        comb.clear();
-
-    for (auto& allpass : allpasses)
-        allpass.clear();
-}
-
-float JuiceReverbAudioProcessor::ChannelReverbTank::process (float input,
-                                                             float feedback,
-                                                             float damping,
-                                                             float diffusion) noexcept
-{
-    float sum = 0.0f;
-
-    for (auto& comb : combs)
-        sum += comb.process (input, feedback, damping);
-
-    // 여러 comb가 합쳐지면 레벨이 커지므로 적당히 낮춥니다.
-    float output = sum * 0.125f;
-
-    for (auto& allpass : allpasses)
-        output = allpass.process (output, diffusion);
-
-    return output;
-}
-
-//==============================================================================
-void JuiceReverbAudioProcessor::StereoReverbTank::prepare (double sampleRate)
-{
-    currentSampleRate = isFiniteAndPositive (sampleRate) ? sampleRate : 44100.0;
-
-    leftTank.prepare (currentSampleRate, 0);
-    rightTank.prepare (currentSampleRate, stereoSpreadSamples);
     clear();
 }
 
-void JuiceReverbAudioProcessor::StereoReverbTank::clear() noexcept
+void JuiceEQAudioProcessor::MainChannelState::clear() noexcept
 {
-    leftTank.clear();
-    rightTank.clear();
-    lfoPhase = 0.0f;
+    inputRing.fill (0.0f);
+    std::fill (dryDelay.begin(), dryDelay.end(), 0.0f);
+    std::fill (processedOverlap.begin(), processedOverlap.end(), 0.0f);
+    std::fill (deltaOverlap.begin(), deltaOverlap.end(), 0.0f);
+
+    inputWriteIndex = 0;
+    dryDelayIndex = 0;
+    overlapReadIndex = 0;
 }
 
-void JuiceReverbAudioProcessor::StereoReverbTank::process (float inputLeft,
-                                                           float inputRight,
-                                                           float feedback,
-                                                           float damping,
-                                                           float size,
-                                                           float& outputLeft,
-                                                           float& outputRight) noexcept
+void JuiceEQAudioProcessor::SidechainChannelState::clear() noexcept
 {
-    const float safeSize = juce::jlimit (0.0f, 1.0f, size);
-
-    // 아주 느린 LFO로 좌우 feedback과 diffusion을 미세하게 흔듭니다.
-    // 딜레이 시간을 직접 흔드는 방식보다 단순하지만, 꼬리가 고정되어 들리는 느낌을 줄여줍니다.
-    const float lfoSpeedHz = 0.055f + safeSize * 0.07f;
-    lfoPhase += juce::MathConstants<float>::twoPi * lfoSpeedHz / static_cast<float> (currentSampleRate);
-
-    if (lfoPhase > juce::MathConstants<float>::twoPi)
-        lfoPhase -= juce::MathConstants<float>::twoPi;
-
-    const float modulation = std::sin (lfoPhase);
-    const float leftFeedback = juce::jlimit (0.5f, 0.975f, feedback + modulation * 0.0045f);
-    const float rightFeedback = juce::jlimit (0.5f, 0.975f, feedback - modulation * 0.0045f);
-    const float diffusion = juce::jlimit (0.42f, 0.72f, 0.50f + safeSize * 0.12f + modulation * 0.018f);
-
-    const float mono = (inputLeft + inputRight) * 0.5f;
-    const float leftInput = inputLeft * 0.62f + mono * 0.38f;
-    const float rightInput = inputRight * 0.62f + mono * 0.38f;
-
-    const float rawLeft = leftTank.process (leftInput, leftFeedback, damping, diffusion);
-    const float rawRight = rightTank.process (rightInput, rightFeedback, damping, diffusion);
-
-    // 약한 crossfeed가 좌우 탱크를 붙여서 큰 홀처럼 느껴지게 합니다.
-    outputLeft = rawLeft * 0.88f + rawRight * 0.12f;
-    outputRight = rawRight * 0.88f + rawLeft * 0.12f;
+    inputRing.fill (0.0f);
+    inputWriteIndex = 0;
 }
 
 //==============================================================================
-// JUCE가 플러그인 인스턴스를 만들 때 호출하는 진입점입니다.
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new JuiceReverbAudioProcessor();
+    return new JuiceEQAudioProcessor();
 }
