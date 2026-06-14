@@ -56,7 +56,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --version
-          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format table
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -property installationPath
 
       - name: Configure CMake
         shell: pwsh
