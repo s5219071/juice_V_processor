@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(JuiceEQ VERSION 2.0.0 LANGUAGES CXX)
+project(JuiceEQ VERSION 2.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +27,7 @@ FetchContent_MakeAvailable(JUCE)
 # Keep the internal CMake target name stable while exposing the new product
 # name to DAWs and the generated VST3 bundle.
 juce_add_plugin(JuiceEQ
-    VERSION 2.0.0
+    VERSION 2.0.1
     COMPANY_NAME "JuiceLab"
     COMPANY_WEBSITE "https://github.com"
     COMPANY_EMAIL "juicelab@example.com"
@@ -43,7 +43,7 @@ juce_add_plugin(JuiceEQ
     COPY_PLUGIN_AFTER_BUILD FALSE
 
     PLUGIN_MANUFACTURER_CODE JLab
-    PLUGIN_CODE JEQP
+    PLUGIN_CODE JVR1
 
     PRODUCT_NAME "Juice Vocal Restorer"
     BUNDLE_ID "com.juicelab.juicevocalrestorer"
