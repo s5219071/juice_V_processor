@@ -44,7 +44,9 @@ permissions:
 jobs:
   build-windows-vst3:
     name: Build Windows VST3
-    runs-on: windows-latest
+    # windows-latest moved to the Visual Studio 2026 image in June 2026.
+    # Pin VS 2022 because the CMake generator below explicitly targets VS 17.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
@@ -54,6 +56,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --version
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format table
 
       - name: Configure CMake
         shell: pwsh
