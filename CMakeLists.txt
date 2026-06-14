@@ -24,8 +24,8 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(JUCE)
 
-# The target and output name remain JuiceEQ so the existing Windows/macOS
-# packaging workflow continues to find JuiceEQ.vst3.
+# Keep the internal CMake target name stable while exposing the new product
+# name to DAWs and the generated VST3 bundle.
 juce_add_plugin(JuiceEQ
     VERSION 2.0.0
     COMPANY_NAME "JuiceLab"
@@ -45,8 +45,8 @@ juce_add_plugin(JuiceEQ
     PLUGIN_MANUFACTURER_CODE JLab
     PLUGIN_CODE JEQP
 
-    PRODUCT_NAME "JuiceEQ"
-    BUNDLE_ID "com.juicelab.juiceeq"
+    PRODUCT_NAME "Juice Vocal Restorer"
+    BUNDLE_ID "com.juicelab.juicevocalrestorer"
 )
 
 target_sources(JuiceEQ

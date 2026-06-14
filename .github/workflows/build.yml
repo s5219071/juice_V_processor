@@ -7,7 +7,7 @@
 # 로컬 환경에 JUCE가 없어도 CMake가 JUCE를 내려받아 사용합니다.
 #
 # 실행 방법:
-# - GitHub 저장소의 Actions 탭에서 "Build JuiceEQ VST3"를 수동 실행합니다.
+# - GitHub 저장소의 Actions 탭에서 "Build Juice Vocal Restorer VST3"를 수동 실행합니다.
 # - main/master 브랜치에 push하면 자동으로 빌드합니다.
 # - v1.0.0 같은 태그를 push하면 GitHub Release를 만들 수 있습니다.
 # ==============================================================================
@@ -73,25 +73,25 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $vst3 = Get-ChildItem -Path "build" -Recurse -Directory -Filter "JuiceEQ.vst3" | Select-Object -First 1
+          $vst3 = Get-ChildItem -Path "build" -Recurse -Directory -Filter "Juice Vocal Restorer.vst3" | Select-Object -First 1
 
           if ($null -eq $vst3) {
             Write-Host "Build folder contents:"
             Get-ChildItem -Path "build" -Recurse | Select-Object -ExpandProperty FullName
-            throw "JuiceEQ.vst3 was not found."
+            throw "Juice Vocal Restorer.vst3 was not found."
           }
 
           New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
           Copy-Item -LiteralPath $vst3.FullName -Destination "artifacts" -Recurse -Force
-          Compress-Archive -Path "artifacts/JuiceEQ.vst3" -DestinationPath "dist/JuiceEQ-Windows-VST3.zip" -Force
+          Compress-Archive -Path "artifacts/Juice Vocal Restorer.vst3" -DestinationPath "dist/Juice-Vocal-Restorer-Windows-VST3.zip" -Force
 
       - name: Upload Windows VST3 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JuiceEQ-Windows-VST3
-          path: dist/JuiceEQ-Windows-VST3.zip
+          name: Juice-Vocal-Restorer-Windows-VST3
+          path: dist/Juice-Vocal-Restorer-Windows-VST3.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -131,12 +131,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          vst3="$(find build -type d -name 'JuiceEQ.vst3' -print -quit)"
+          vst3="$(find build -type d -name 'Juice Vocal Restorer.vst3' -print -quit)"
 
           if [[ -z "${vst3}" ]]; then
             echo "Build folder contents:"
             find build -maxdepth 6 -print
-            echo "JuiceEQ.vst3 was not found."
+            echo "Juice Vocal Restorer.vst3 was not found."
             exit 1
           fi
 
@@ -150,7 +150,7 @@ jobs:
           fi
 
           if [[ "${signing_ready}" == "true" ]]; then
-            echo "Developer ID certificate found. Importing certificate and signing JuiceEQ.vst3."
+            echo "Developer ID certificate found. Importing certificate and signing Juice Vocal Restorer.vst3."
 
             keychain_password="$(uuidgen)"
             keychain_path="${RUNNER_TEMP}/juiceeq-signing.keychain-db"
@@ -176,14 +176,14 @@ jobs:
               exit 1
             fi
 
-            codesign --force --deep --timestamp --options runtime --sign "${signing_identity}" "artifacts/JuiceEQ.vst3"
+            codesign --force --deep --timestamp --options runtime --sign "${signing_identity}" "artifacts/Juice Vocal Restorer.vst3"
           else
             echo "Apple Developer ID certificate secrets were not configured."
             echo "Creating an ad-hoc signed VST3. This can trigger Gatekeeper malware-check/update warnings on macOS."
-            codesign --force --deep --sign - "artifacts/JuiceEQ.vst3"
+            codesign --force --deep --sign - "artifacts/Juice Vocal Restorer.vst3"
           fi
 
-          codesign --verify --deep --strict "artifacts/JuiceEQ.vst3"
+          codesign --verify --deep --strict "artifacts/Juice Vocal Restorer.vst3"
 
           notarization_ready="false"
 
@@ -192,10 +192,10 @@ jobs:
           fi
 
           if [[ "${notarization_ready}" == "true" ]]; then
-            echo "Submitting JuiceEQ.vst3 to Apple notarization."
+            echo "Submitting Juice Vocal Restorer.vst3 to Apple notarization."
 
-            notary_upload_zip="dist/JuiceEQ-macOS-Universal-VST3-notary-upload.zip"
-            ditto -c -k --sequesterRsrc --keepParent "artifacts/JuiceEQ.vst3" "${notary_upload_zip}"
+            notary_upload_zip="dist/Juice-Vocal-Restorer-macOS-Universal-VST3-notary-upload.zip"
+            ditto -c -k --sequesterRsrc --keepParent "artifacts/Juice Vocal Restorer.vst3" "${notary_upload_zip}"
 
             xcrun notarytool submit "${notary_upload_zip}" \
               --apple-id "${APPLE_ID}" \
@@ -203,21 +203,21 @@ jobs:
               --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
               --wait
 
-            xcrun stapler staple -v "artifacts/JuiceEQ.vst3"
-            xcrun stapler validate -v "artifacts/JuiceEQ.vst3"
+            xcrun stapler staple -v "artifacts/Juice Vocal Restorer.vst3"
+            xcrun stapler validate -v "artifacts/Juice Vocal Restorer.vst3"
             rm -f "${notary_upload_zip}"
           else
             echo "Apple notarization secrets were not configured."
             echo "Skipping notarization. Public macOS distribution should use a notarized artifact."
           fi
 
-          ditto -c -k --sequesterRsrc --keepParent "artifacts/JuiceEQ.vst3" "dist/JuiceEQ-macOS-Universal-VST3.zip"
+          ditto -c -k --sequesterRsrc --keepParent "artifacts/Juice Vocal Restorer.vst3" "dist/Juice-Vocal-Restorer-macOS-Universal-VST3.zip"
 
       - name: Upload macOS VST3 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JuiceEQ-macOS-Universal-VST3
-          path: dist/JuiceEQ-macOS-Universal-VST3.zip
+          name: Juice-Vocal-Restorer-macOS-Universal-VST3
+          path: dist/Juice-Vocal-Restorer-macOS-Universal-VST3.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -265,6 +265,6 @@ jobs:
             gh release create "${tag}" dist/*.zip \
               --repo "${GH_REPO}" \
               --target "${GITHUB_SHA}" \
-              --title "JuiceEQ ${tag}" \
-              --notes "Windows VST3 and macOS Universal VST3 builds for JuiceEQ."
+              --title "Juice Vocal Restorer ${tag}" \
+              --notes "Windows VST3 and macOS Universal VST3 builds for Juice Vocal Restorer."
           fi

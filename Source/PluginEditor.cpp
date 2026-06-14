@@ -453,7 +453,7 @@ void JuiceEQAudioProcessorEditor::paint (juce::Graphics& g)
     auto title = getLocalBounds().reduced (26).removeFromTop (48);
     g.setColour (text);
     g.setFont (juce::Font (juce::FontOptions (23.0f, juce::Font::bold)));
-    g.drawText ("AI VOCAL RESTORER", title, juce::Justification::centredLeft);
+    g.drawText ("JUICE VOCAL RESTORER", title, juce::Justification::centredLeft);
 
     g.setColour (gold);
     g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
@@ -479,7 +479,7 @@ void JuiceEQAudioProcessorEditor::paint (juce::Graphics& g)
 
     g.setColour (muted.withAlpha (0.75f));
     g.setFont (juce::Font (juce::FontOptions (9.0f)));
-    g.drawText ("Gold: total response   Aqua: FFT / dynamic bands",
+    g.drawText ("Made by Kino",
                 getLocalBounds().reduced (24).removeFromBottom (18),
                 juce::Justification::centredRight);
 }
